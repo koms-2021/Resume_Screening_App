@@ -12,3 +12,7 @@ chromadb
 langchain-chroma
 streamlit
 rank-bm25
+transformers
+torch
+torchvision
+torchaudio
