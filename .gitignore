@@ -5,12 +5,8 @@ build/
 dist/
 wheels/
 *.egg-info
-
-# Virtual environments
 .venv
-
 .env
-
 chroma_db
 embeddings
 chunks
