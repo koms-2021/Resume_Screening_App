@@ -29,8 +29,23 @@ from pipeline import (  # pyrefly: ignore [missing-import]
 )
 
 load_dotenv(override=True)
-os.environ["GROQ_API_KEY"] = os.getenv("GROQ_API_KEY") or ""
-os.environ["GOOGLE_API_KEY"] = os.getenv("GOOGLE_API_KEY") or ""
+
+
+def get_secret(*names, default=""):
+    for name in names:
+        try:
+            value = st.secrets.get(name)
+        except Exception:
+            value = None
+
+        if value:
+            return str(value)
+
+        value = os.getenv(name)
+        if value:
+            return value
+
+    return default
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -48,6 +63,9 @@ st.set_page_config(
     page_title="Resume Screening System",
     layout="wide",
 )
+
+os.environ["GROQ_API_KEY"] = get_secret("GROQ_API_KEY")
+os.environ["GOOGLE_API_KEY"] = get_secret("GOOGLE_API_KEY")
 
 st.markdown(
     """
@@ -174,33 +192,33 @@ if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
 
 @st.cache_resource
 def load_chromadb():
-    chroma_api_key = os.getenv("CHROMA_API_KEY") or os.getenv("Chroma_API_KEY")
+    chroma_api_key = get_secret("CHROMA_API_KEY", "Chroma_API_KEY")
     chroma_tenant = (
-        os.getenv("CHROMA_TENANT")
-        or os.getenv("Chroma_tenant_Id")
-        or os.getenv("Tenant_Id")
+        get_secret("CHROMA_TENANT_ID")
+        or get_secret("Chroma_tenant_Id")
+        or get_secret("Tenant_Id")
     )
     chroma_database = (
-        os.getenv("CHROMA_DATABASE")
-        or os.getenv("Chroma_database_Id")
-        or os.getenv("Chroma_Database")
-        or os.getenv("Database_Name")
-        or os.getenv("Database")
+        get_secret("CHROMA_DATABASE_ID")
+        or get_secret("Chroma_database_Id")
+        or get_secret("Chroma_Database")
+        or get_secret("Database_Name")
+        or get_secret("Database")
     )
 
     missing = [
         name
         for name, value in {
             "CHROMA_API_KEY": chroma_api_key,
-            "CHROMA_TENANT": chroma_tenant,
-            "CHROMA_DATABASE": chroma_database,
+            "CHROMA_TENANT_ID": chroma_tenant,
+            "CHROMA_DATABASE_ID": chroma_database,
         }.items()
         if not value
     ]
 
     if missing:
         raise ValueError(
-            "Missing Chroma Cloud environment variable(s): "
+            "Missing Chroma Cloud secret(s) or environment variable(s): "
             + ", ".join(missing)
         )
 
@@ -227,15 +245,18 @@ def load_chromadb():
 
 @st.cache_resource
 def load_supabase_client():
-    supabase_url = os.getenv("SUPABASE_URL")
+    supabase_url = get_secret("SUPABASE_URL")
     supabase_key = (
-        os.getenv("SUPABASE_ANON_KEY")
-        or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-        or os.getenv("SUPABASE_KEY")
+        get_secret("SUPABASE_ANON_KEY")
+        or get_secret("SUPABASE_SERVICE_ROLE_KEY")
+        or get_secret("SUPABASE_KEY")
     )
 
     if not supabase_url or not supabase_key:
-        raise ValueError("Missing SUPABASE_URL or Supabase API key in .env")
+        raise ValueError(
+            "Missing SUPABASE_URL or Supabase API key in Streamlit secrets "
+            "or environment variables"
+        )
 
     return create_client(supabase_url, supabase_key)
 
