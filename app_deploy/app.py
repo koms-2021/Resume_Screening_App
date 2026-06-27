@@ -2,6 +2,7 @@ import json
 import os
 import sys
 import tempfile
+import importlib
 
 import chromadb
 import streamlit as st
@@ -11,6 +12,13 @@ from langchain_groq import ChatGroq
 from supabase import create_client
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import pipeline as pipeline_module  # pyrefly: ignore [missing-import]
+
+# Streamlit can rerun this file while retaining an older imported pipeline in
+# sys.modules. Reload it so parser/scoring fixes are applied without requiring
+# the user to kill the existing Streamlit process manually.
+pipeline_module = importlib.reload(pipeline_module)
 
 from pipeline import (  # pyrefly: ignore [missing-import]
     build_resume_chunks_dict,
@@ -31,6 +39,10 @@ JD_DISPLAY_NAMES = {
     "SWE_JD.txt": "Software Engineer",
     "PM_JD.txt": "Product Manager",
 }
+
+# Increment whenever stored score/summary output becomes incompatible with the
+# current pipeline. This prevents Streamlit from displaying stale session cards.
+RESULT_SCHEMA_VERSION = 3
 
 st.set_page_config(
     page_title="Resume Screening System",
@@ -153,6 +165,11 @@ if "uploaded_session_resume" not in st.session_state:
 
 if "show_upload" not in st.session_state:
     st.session_state.show_upload = True
+
+if st.session_state.get("result_schema_version") != RESULT_SCHEMA_VERSION:
+    st.session_state.summaries = None
+    st.session_state.open_candidate = None
+    st.session_state.result_schema_version = RESULT_SCHEMA_VERSION
 
 
 @st.cache_resource
@@ -326,6 +343,18 @@ def process_session_upload(uploaded_resume, llm):
 
         if result.get("filename"):
             result["filename"] = uploaded_resume.name
+
+        if result.get("status") == "processed":
+            candidate_name = str(
+                (result.get("resume") or {}).get("name") or "Candidate"
+            ).strip()
+            if candidate_name.isupper():
+                candidate_name = candidate_name.title()
+
+            result["message"] = (
+                f"{candidate_name} ({uploaded_resume.name}) "
+                "processed for this session."
+            )
 
         return result
     finally:

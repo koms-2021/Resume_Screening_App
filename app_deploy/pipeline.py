@@ -985,34 +985,154 @@ def aggregate_scores(all_matches):
 
 
 # STEP 4 - Experience penalty (low impact)
-def parse_date(date_str):
-    if not date_str or "present" in date_str.lower():
-        return datetime.today()
+CURRENT_DATE_LABELS = {
+    "present", "current", "currently", "now",
+    "ongoing", "till date", "to date"
+}
 
-    for fmt in ("%m/%Y", "%b %Y", "%B %Y", "%Y"):
+
+def parse_date(date_str, as_of=None, prefer_end=False):
+    if date_str is None or not str(date_str).strip():
+        return None
+
+    as_of = as_of or datetime.today()
+    normalized = re.sub(r"\s+", " ", str(date_str).strip())
+    normalized_lower = normalized.lower().rstrip(".")
+
+    if normalized_lower in CURRENT_DATE_LABELS:
+        return as_of
+
+    if prefer_end and any(
+        re.search(rf"\b{re.escape(label)}\b", normalized_lower)
+        for label in CURRENT_DATE_LABELS
+    ):
+        return as_of
+
+    normalized = normalized.replace(",", " ")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    formats = (
+        "%d/%m/%Y",
+        "%m/%d/%Y",
+        "%Y-%m-%d",
+        "%m/%Y",
+        "%m-%Y",
+        "%b %Y",
+        "%B %Y",
+        "%Y",
+    )
+
+    for fmt in formats:
         try:
-            return datetime.strptime(date_str.strip(), fmt)
+            return datetime.strptime(normalized, fmt)
         except ValueError:
             pass
+
+    # Handles a complete range stored in one field:
+    # "Jul, 2021 - Present"
+    date_tokens = re.findall(
+        r"\b(?:"
+        r"\d{4}-\d{1,2}-\d{1,2}|"
+        r"\d{1,2}/\d{1,2}/\d{4}|"
+        r"\d{1,2}[/-]\d{4}|"
+        r"(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+        r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+        r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[,.]?\s+\d{4}|"
+        r"\d{4}"
+        r")\b",
+        normalized,
+        flags=re.IGNORECASE,
+    )
+
+    if date_tokens:
+        token = date_tokens[-1] if prefer_end else date_tokens[0]
+        token = token.replace(",", " ").replace(".", " ")
+        token = re.sub(r"\s+", " ", token).strip()
+
+        for fmt in formats:
+            try:
+                return datetime.strptime(token, fmt)
+            except ValueError:
+                pass
 
     return None
 
 
-def compute_experience_years(experience_list):
-    """Calculate total years of experience from parsed resume roles."""
-    total_months = 0
+def _month_index(value):
+    return value.year * 12 + value.month - 1
 
-    for exp in (experience_list or []):
-        start = parse_date(exp.get("start_date"))
-        end = parse_date(exp.get("end_date"))
 
-        if not start or not end:
+def compute_experience_years(experience_list, as_of=None):
+    as_of = as_of or datetime.today()
+    intervals = []
+
+    for exp in experience_list or []:
+        start_value = exp.get("start_date")
+        end_value = exp.get("end_date")
+
+        start = parse_date(start_value, as_of=as_of)
+
+        if end_value:
+            end = parse_date(
+                end_value,
+                as_of=as_of,
+                prefer_end=True,
+            )
+        elif re.search(r"\s*[-–—]\s*", str(start_value or "")):
+            end = parse_date(
+                start_value,
+                as_of=as_of,
+                prefer_end=True,
+            )
+        else:
+            end = as_of
+
+        # Recover dates if the parser placed them in another field.
+        if not start:
+            exp_text = " ".join(
+                str(value)
+                for value in exp.values()
+                if value is not None
+            )
+            start = parse_date(exp_text, as_of=as_of)
+            end = (
+                parse_date(
+                    exp_text,
+                    as_of=as_of,
+                    prefer_end=True,
+                )
+                or end
+            )
+
+        if not start or not end or end < start:
             continue
 
-        total_months += max(
-            0,
-            (end.year - start.year) * 12 + (end.month - start.month)
+        intervals.append(
+            (
+                _month_index(start),
+                _month_index(min(end, as_of)),
+            )
         )
+
+    if not intervals:
+        return 0.0
+
+    # Merge adjacent and overlapping roles.
+    merged = []
+
+    for start_month, end_month in sorted(intervals):
+        if not merged or start_month > merged[-1][1] + 1:
+            merged.append([start_month, end_month])
+        else:
+            merged[-1][1] = max(
+                merged[-1][1],
+                end_month,
+            )
+
+    total_months = sum(
+        end_month - start_month
+        for start_month, end_month in merged
+    )
 
     return round(total_months / 12, 1)
 
@@ -1275,14 +1395,6 @@ def get_top_candidates(jd_filename, resume_collection,
 
     return ranked[:top_n]
 
-
-# STEP 5 - Summary generation
-def clean_json_str(json_str):
-    import re
-    json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
-    return json_str
-
-
 def build_compact_resume(resume_parsed):
     experience = resume_parsed.get("experience") or []
     compact_exp = []
@@ -1318,6 +1430,33 @@ def clean_json_str(json_str):
     # Remove trailing commas before } or ]
     json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
     return json_str
+
+
+def normalize_summary_experience(summary, resume_years):
+    """
+    Replace stale LLM experience claims with the deterministic experience
+    calculated from resume employment dates.
+    """
+    if not isinstance(summary, dict):
+        return summary
+
+    years_text = f"{resume_years} years of experience"
+    experience_pattern = re.compile(
+        r"\b\d+(?:\.\d+)?\s*\+?\s*years?(?:'|’)?(?:\s+of)?\s+experience\b",
+        flags=re.IGNORECASE,
+    )
+
+    def normalize_value(value):
+        if isinstance(value, str):
+            return experience_pattern.sub(years_text, value)
+        if isinstance(value, list):
+            return [normalize_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: normalize_value(item) for key, item in value.items()}
+        return value
+
+    return normalize_value(summary)
+
 
 def generate_candidate_summary(candidate_filename, jd_filename,
                                 all_resumes, all_jds, llm,
@@ -1355,7 +1494,10 @@ Based on the above, generate a structured evaluation in the following JSON forma
     "candidate_name"     : string,
     "match_summary"      : string (2-3 sentences overview of why this candidate fits or doesnt fit),
     "key_strengths"      : [string] (top 1-2 reasons this candidate is suitable),
-    "skill_gaps"         : [string] (skills in JD that candidate is missing),
+    "skill_gaps"         : [string] (Only missing atomic JD capabilities.
+  Do not include broad grouped requirements.
+  Do not include capabilities with direct, equivalent, adjacent, or transferable resume evidence.
+),
     "experience_summary" : string (brief summary of relevant experience),
     "recommendation"     : string (1-2 sentences final recommendation for the recruiter)
 }
@@ -1366,6 +1508,25 @@ Rules:
 3. Do not make anything up. Only use information present in the resume.
 4. Keep each string concise and professional.
 5. Dont include Company name anywhere in the response.
+6. Evaluate JD requirements lexically and semantically.Consider demonstrated outcomes, projects, responsibilities, and equivalent workflows as evidence even when the JD uses different terminology.
+7. Before listing a gap, search all resume fields—summary, skills, experience, projects, responsibilities, technologies, and certifications—for direct or semantically equivalent evidence
+
+Example:
+JD requirement: "Experience with Tool A, Tool B, workflow automation, and stakeholder communication."
+
+Resume evidence:
+- Mentions Tool A or a closely related tool from the same ecosystem.
+- Shows projects where the candidate automated manual work.
+- Describes presenting insights or collaborating with business teams.
+
+Correct skill gaps:
+- No explicit evidence of Tool B.
+
+Incorrect skill gaps:
+- No experience with Tool A, Tool B, workflow automation, or stakeholder communication.
+
+Reason:
+Do not copy the full JD requirement as a gap. Split it into atomic capabilities, remove anything supported by direct, equivalent, adjacent, or transferable resume evidence, and return only the truly missing capability.
 """
 
     formatted_prompt = summary_template \
@@ -1394,7 +1555,7 @@ Rules:
 
     try:
         summary = json.loads(json_str)
-        return summary
+        return normalize_summary_experience(summary, scores["resume_years"])
     except json.JSONDecodeError as e:
         print(f"Failed to parse summary for {candidate_filename}: {e}")
         return None
