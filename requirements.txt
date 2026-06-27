@@ -17,4 +17,4 @@ torch
 torchvision
 torchaudio
 supabase
-PyMuPDFLoader
+pymupdf
