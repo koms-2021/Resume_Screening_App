@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import tempfile
 import importlib
@@ -58,6 +59,22 @@ JD_DISPLAY_NAMES = {
 # Increment whenever stored score/summary output becomes incompatible with the
 # current pipeline. This prevents Streamlit from displaying stale session cards.
 RESULT_SCHEMA_VERSION = 3
+
+PERMANENT_RESUME_NAME_SET = {
+    "abhishek_shaurya_resume",
+    "jay kumar behera_cv_ds",
+    "komal_kamble_1",
+    "meetlad_resume",
+    "prity-kumari-resume-devops-2025",
+    "soumyadeep_sen_cv",
+    "manandaxini-updated-2026-t",
+}
+
+
+def normalize_uploaded_resume_name(filename):
+    resume_name = os.path.splitext(filename)[0]
+    resume_name = re.sub(r"(?:\s*\(\d+\))+$", "", resume_name)
+    return resume_name.strip().lower()
 
 st.set_page_config(
     page_title="Resume Screening System",
@@ -280,10 +297,19 @@ def fetch_all_rows(supabase, table_name, page_size=1000):
 
 
 @st.cache_resource
-def load_llm():
+def load_summary_llm():
     return ChatGroq(
         model="llama-3.1-8b-instant",
         temperature=0,
+    )
+
+
+@st.cache_resource
+def load_resume_parser_llm():
+    return ChatGroq(
+        model="qwen/qwen3-32b",
+        temperature=0,
+        max_tokens=2000,
     )
 
 
@@ -349,6 +375,21 @@ def show_upload_form():
 
 
 def process_session_upload(uploaded_resume, llm):
+    uploaded_resume_name = normalize_uploaded_resume_name(uploaded_resume.name)
+
+    if uploaded_resume_name in PERMANENT_RESUME_NAME_SET:
+        return {
+            "status": "skipped",
+            "message": (
+                f"{uploaded_resume_name} is already in the system, "
+                "so this resume does not need to be processed again."
+            ),
+            "filename": uploaded_resume.name,
+            "resume": None,
+            "chunks": [],
+            "embedded_chunks": [],
+        }
+
     suffix = os.path.splitext(uploaded_resume.name)[1] or ".pdf"
     temp_path = None
 
@@ -357,10 +398,29 @@ def process_session_upload(uploaded_resume, llm):
             temp_file.write(uploaded_resume.getbuffer())
             temp_path = temp_file.name
 
-        result = process_uploaded_resume_for_session(
-            file_path=temp_path,
-            llm=llm,
-        )
+        try:
+            result = process_uploaded_resume_for_session(
+                file_path=temp_path,
+                llm=llm,
+            )
+        except Exception as exc:
+            error_text = str(exc)
+            if "rate_limit_exceeded" in error_text or "tokens per minute" in error_text:
+                message = (
+                    "The uploaded resume is too large for the current Groq token "
+                    "limit. Please try a shorter resume or upgrade the Groq tier."
+                )
+            else:
+                message = f"Could not process uploaded resume: {exc}"
+
+            return {
+                "status": "failed",
+                "message": message,
+                "filename": uploaded_resume.name,
+                "resume": None,
+                "chunks": [],
+                "embedded_chunks": [],
+            }
 
         if result.get("filename"):
             result["filename"] = uploaded_resume.name
@@ -438,7 +498,7 @@ if run_button:
 
     with st.spinner("Loading models and database..."):
         resume_collection, jd_collection = load_chromadb()
-        llm = load_llm()
+        summary_llm = load_summary_llm()
         all_jds, all_resumes, all_resume_chunks = load_json_data()
 
     jd_parsed = all_jds.get(selected_jd, {})
@@ -476,7 +536,7 @@ if run_button:
             jd_filename=selected_jd,
             all_resumes=all_resumes,
             all_jds=all_jds,
-            llm=llm,
+            llm=summary_llm,
         )
 
 if st.session_state.show_upload and not st.session_state.summaries:
@@ -503,10 +563,10 @@ if st.session_state.show_upload and not st.session_state.summaries:
                     st.warning("Please choose a PDF resume first.")
                 else:
                     with st.spinner("Processing uploaded resume..."):
-                        llm = load_llm()
+                        resume_parser_llm = load_resume_parser_llm()
                         st.session_state.upload_result = process_session_upload(
                             uploaded_resume=uploaded_resume,
-                            llm=llm,
+                            llm=resume_parser_llm,
                         )
                         if st.session_state.upload_result.get("status") == "processed":
                             st.session_state.uploaded_session_resume = st.session_state.upload_result
@@ -569,6 +629,10 @@ if st.session_state.summaries:
         candidate_name = summary.get("candidate_name", filename)
         match_score = scores["percentage"]
         score_color = get_score_color(match_score)
+        resume_experience_text = scores.get(
+            "resume_experience_text",
+            f"{scores['resume_years']} yrs",
+        )
 
         with st.container(border=True):
             col_rank, col_candidate, col_score, col_action = st.columns(
@@ -590,7 +654,7 @@ if st.session_state.summaries:
                         {match_score}
                     </div>
                     <div class="experience-text">
-                        Experience: {scores['resume_years']} yrs
+                        Experience: {resume_experience_text}
                     </div>
                     """,
                     unsafe_allow_html=True,

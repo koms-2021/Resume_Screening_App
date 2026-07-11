@@ -48,6 +48,7 @@ ALL_RESUME_CHUNKS_PATH = os.path.join(CHUNKS_DIR, "all_resume_chunks.json")
 ALL_RESUME_EMBEDDINGS_PATH = os.path.join(EMBEDDINGS_DIR, "all_resume_embeddings.json")
 RESUME_EMBEDDING_MODEL_NAME = "BAAI/bge-large-en-v1.5"
 EXPECTED_RESUME_EMBEDDING_DIM = 1024
+MAX_RESUME_PARSE_TEXT_CHARS = 9000
 
 
 # Upload processing helpers
@@ -183,15 +184,6 @@ def build_resume_chunks_dict(rows):
     }
 
 
-def save_json_file(path, data):
-    folder = os.path.dirname(path)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-
-
 def extract_json_from_llm_response(response_text):
     response_text = response_text.strip()
 
@@ -213,6 +205,8 @@ def get_json(file_path, llm, template=RESUME_EXTRACTION_TEMPLATE):
     loader = PyMuPDFLoader(file_path)
     documents = loader.load()
     extracted_text = "\n".join(doc.page_content for doc in documents)
+    if len(extracted_text) > MAX_RESUME_PARSE_TEXT_CHARS:
+        extracted_text = extracted_text[:MAX_RESUME_PARSE_TEXT_CHARS]
 
     formatted_prompt = template.replace("{extracted_text}", extracted_text) + "\n/no_think"
     response = llm.invoke(formatted_prompt).content
@@ -222,94 +216,6 @@ def get_json(file_path, llm, template=RESUME_EXTRACTION_TEMPLATE):
     except json.JSONDecodeError as e:
         print(f"Failed to parse resume JSON for {os.path.basename(file_path)}: {e}")
         return None
-
-
-def process_single_resume(file_path, llm, output_folder=RESUME_OUTPUT_DIR, force=False):
-    """
-    Parse one PDF resume and add it to all_resumes.json.
-    Existing filenames are skipped unless force=True.
-    """
-
-    os.makedirs(output_folder, exist_ok=True)
-
-    pdf_file = os.path.basename(file_path)
-    combined_output = os.path.join(output_folder, "all_resumes.json")
-    all_results = load_json_file(combined_output, {})
-
-    if pdf_file in all_results and not force:
-        return {
-            "status": "skipped",
-            "message": f"{pdf_file} is already processed.",
-            "filename": pdf_file,
-            "data": all_results[pdf_file]
-        }
-
-    parsed = get_json(file_path, llm)
-
-    if not parsed:
-        return {
-            "status": "failed",
-            "message": f"Could not parse {pdf_file}.",
-            "filename": pdf_file,
-            "data": None
-        }
-
-    output_file = os.path.join(output_folder, pdf_file.replace(".pdf", ".json"))
-    save_json_file(output_file, parsed)
-
-    all_results[pdf_file] = parsed
-    save_json_file(combined_output, all_results)
-
-    return {
-        "status": "processed",
-        "message": f"{pdf_file} processed and added to all_resumes.json.",
-        "filename": pdf_file,
-        "data": parsed
-    }
-
-
-def process_multiple_resumes(folder_path, llm, output_folder=RESUME_OUTPUT_DIR):
-    """
-    Process only new PDF resumes from a folder.
-    Internally reuses process_single_resume().
-    """
-
-    pdf_files = [
-        f for f in os.listdir(folder_path)
-        if f.lower().endswith(".pdf")
-    ]
-
-    if not pdf_files:
-        print("No PDF files found in the folder.")
-        return {}
-
-    results = {}
-    already_processed = 0
-    new_processed = 0
-    failed = 0
-
-    for pdf_file in pdf_files:
-        result = process_single_resume(
-            file_path=os.path.join(folder_path, pdf_file),
-            llm=llm,
-            output_folder=output_folder,
-            force=False
-        )
-        results[pdf_file] = result
-
-        if result["status"] == "skipped":
-            already_processed += 1
-        elif result["status"] == "processed":
-            new_processed += 1
-        else:
-            failed += 1
-
-    print("\nResume Parsing Summary")
-    print(f"Already processed: {already_processed}")
-    print(f"New resumes processed: {new_processed}")
-    print(f"Failed: {failed}")
-
-    return results
 
 
 def chunk_resume(parsed_resume):
@@ -415,49 +321,6 @@ def chunk_resume(parsed_resume):
     return chunks
 
 
-def chunk_single_resume(filename, resume_data, all_chunks_path=ALL_RESUME_CHUNKS_PATH, force=False):
-    all_resume_chunks = load_json_file(all_chunks_path, {})
-
-    if filename in all_resume_chunks and not force:
-        return all_resume_chunks, {}, {
-            "status": "skipped",
-            "message": f"{filename} is already chunked."
-        }
-
-    chunks = chunk_resume(resume_data)
-    if not chunks:
-        return all_resume_chunks, {}, {
-            "status": "failed",
-            "message": f"No chunks created for {filename}."
-        }
-
-    all_resume_chunks[filename] = chunks
-    save_json_file(all_chunks_path, all_resume_chunks)
-
-    return all_resume_chunks, {filename: chunks}, {
-        "status": "chunked",
-        "message": f"{filename} chunked into {len(chunks)} chunks."
-    }
-
-
-def chunk_new_resumes(all_resumes_path=ALL_RESUME_PATH, all_chunks_path=ALL_RESUME_CHUNKS_PATH):
-    all_resumes = load_json_file(all_resumes_path, {})
-    all_resume_chunks = load_json_file(all_chunks_path, {})
-    new_resume_chunks = {}
-
-    for filename, resume_data in all_resumes.items():
-        if filename in all_resume_chunks:
-            continue
-
-        chunks = chunk_resume(resume_data)
-        if chunks:
-            all_resume_chunks[filename] = chunks
-            new_resume_chunks[filename] = chunks
-
-    save_json_file(all_chunks_path, all_resume_chunks)
-    return all_resume_chunks, new_resume_chunks
-
-
 def load_embedding_model():
     from langchain_huggingface import HuggingFaceEmbeddings
 
@@ -488,170 +351,6 @@ def generate_embeddings(all_chunks, embedding_model=None):
         print(f"Embedded: {filename} -> {len(embedded)} chunks")
 
     return all_embedded_chunks
-
-
-def embeddings_have_expected_dimension(embedded_chunks, expected_dim=EXPECTED_RESUME_EMBEDDING_DIM):
-    if not embedded_chunks:
-        return False
-
-    for chunk in embedded_chunks:
-        embedding = chunk.get("embedding") or []
-        if len(embedding) != expected_dim:
-            return False
-
-    return True
-
-
-def embed_new_resume_chunks(
-    new_chunks,
-    all_embeddings_path=ALL_RESUME_EMBEDDINGS_PATH,
-    embedding_model=None,
-    force=False,
-):
-    all_resume_embeddings = load_json_file(all_embeddings_path, {})
-    new_resume_embeddings = {}
-
-    if not new_chunks:
-        return all_resume_embeddings, new_resume_embeddings
-
-    if embedding_model is None:
-        embedding_model = load_embedding_model()
-
-    for filename, chunks in new_chunks.items():
-        existing_embeddings = all_resume_embeddings.get(filename)
-        existing_is_valid = embeddings_have_expected_dimension(existing_embeddings)
-
-        if existing_embeddings and existing_is_valid and not force:
-            continue
-
-        embedded = generate_embeddings({filename: chunks}, embedding_model=embedding_model)[filename]
-        all_resume_embeddings[filename] = embedded
-        new_resume_embeddings[filename] = embedded
-
-    save_json_file(all_embeddings_path, all_resume_embeddings)
-    return all_resume_embeddings, new_resume_embeddings
-
-
-def get_stored_files(collection):
-    results = collection._collection.get(include=["metadatas"])
-    metadatas = results.get("metadatas") or []
-
-    return {
-        metadata.get("source_file")
-        for metadata in metadatas
-        if metadata and metadata.get("source_file")
-    }
-
-
-def filter_new_embeddings(embeddings_dict, collection):
-    already_stored = get_stored_files(collection)
-    new_embeddings = {}
-    skipped_files = []
-
-    for filename, chunks in embeddings_dict.items():
-        if filename in already_stored:
-            skipped_files.append(filename)
-        else:
-            new_embeddings[filename] = chunks
-
-    return new_embeddings, skipped_files
-
-
-def store_embeddings(embeddings_dict, collection, label="chunks"):
-    new_embeddings, skipped_files = filter_new_embeddings(embeddings_dict, collection)
-
-    ids = []
-    embeddings = []
-    documents = []
-    metadatas = []
-
-    for filename, chunks in new_embeddings.items():
-        for i, chunk in enumerate(chunks):
-            ids.append(f"{filename}_chunk_{i}")
-            embeddings.append(chunk["embedding"])
-            documents.append(chunk["content"])
-            metadatas.append({
-                "source_file": filename,
-                "type": chunk["type"],
-                "chunk_index": i
-            })
-
-    if ids:
-        collection._collection.add(
-            ids=ids,
-            embeddings=embeddings,
-            documents=documents,
-            metadatas=metadatas
-        )
-
-    return {
-        "stored_files": list(new_embeddings.keys()),
-        "skipped_files": skipped_files,
-        "stored_chunks": len(ids),
-        "label": label
-    }
-
-
-def process_uploaded_resume(file_path, llm, resume_collection, embedding_model=None, force=False):
-    """
-    End-to-end helper for UI uploads:
-    PDF -> all_resumes.json -> all_resume_chunks.json -> all_resume_embeddings.json -> ChromaDB.
-    Older resumes are skipped at each stage by filename/source_file.
-    """
-
-    parse_result = process_single_resume(file_path, llm, force=force)
-    filename = parse_result["filename"]
-
-    if parse_result["status"] == "failed":
-        return {"parse": parse_result}
-
-    all_resumes = load_json_file(ALL_RESUME_PATH, {})
-    resume_data = all_resumes.get(filename) or parse_result.get("data")
-
-    _, new_chunks, chunk_result = chunk_single_resume(
-        filename,
-        resume_data,
-        force=force
-    )
-
-    stored_files = get_stored_files(resume_collection)
-    all_chunks = load_json_file(ALL_RESUME_CHUNKS_PATH, {})
-    all_embeddings = load_json_file(ALL_RESUME_EMBEDDINGS_PATH, {})
-    existing_embeddings = all_embeddings.get(filename)
-
-    needs_vector_store = filename not in stored_files
-    needs_embedding_repair = not embeddings_have_expected_dimension(existing_embeddings)
-
-    if not new_chunks and (needs_vector_store or needs_embedding_repair):
-        chunks = all_chunks.get(filename)
-        if chunks:
-            new_chunks = {filename: chunks}
-
-    _, new_embeddings = embed_new_resume_chunks(
-        new_chunks,
-        embedding_model=embedding_model,
-        force=force or needs_embedding_repair,
-    )
-
-    embeddings_to_store = new_embeddings
-    if needs_vector_store and filename not in embeddings_to_store:
-        all_embeddings = load_json_file(ALL_RESUME_EMBEDDINGS_PATH, {})
-        existing_embeddings = all_embeddings.get(filename)
-        if embeddings_have_expected_dimension(existing_embeddings):
-            embeddings_to_store = {filename: existing_embeddings}
-
-    store_result = store_embeddings(
-        embeddings_to_store,
-        resume_collection,
-        label="resume chunks"
-    )
-
-    return {
-        "parse": parse_result,
-        "chunk": chunk_result,
-        "embedding_files": list(new_embeddings.keys()),
-        "vector_store": store_result
-    }
 
 
 def process_uploaded_resume_for_session(file_path, llm, embedding_model=None):
@@ -1137,6 +836,28 @@ def compute_experience_years(experience_list, as_of=None):
     return round(total_months / 12, 1)
 
 
+def format_experience_duration(years):
+    try:
+        total_months = int(round(float(years) * 12))
+    except (TypeError, ValueError):
+        return "N/A"
+
+    if total_months <= 0:
+        return "0 months"
+
+    year_count = total_months // 12
+    month_count = total_months % 12
+    parts = []
+
+    if year_count:
+        parts.append(f"{year_count} {'year' if year_count == 1 else 'years'}")
+
+    if month_count:
+        parts.append(f"{month_count} {'month' if month_count == 1 else 'months'}")
+
+    return " ".join(parts)
+
+
 def extract_jd_min_years(jd_parsed):
     """
     Extract minimum years required from JD.
@@ -1343,7 +1064,9 @@ def get_top_candidates(jd_filename, resume_collection,
             "role_fit_score": f"{round(role_fit_score * 100, 2)}%",
             "experience_fit_score": f"{round(experience_fit_score * 100, 2)}%",
             "resume_years": resume_years,
+            "resume_experience_text": format_experience_duration(resume_years),
             "required_years": jd_min_years,
+            "required_experience_text": format_experience_duration(jd_min_years),
             "exp_penalty": exp_penalty,
             "matched_role_groups": matched_role_groups,
             "chunk_scores": score_data["chunk_scores"]
@@ -1371,7 +1094,7 @@ def get_top_candidates(jd_filename, resume_collection,
         print(f"     Relevance Score : {scores['relevance_score']}")
         print(f"     Role Fit        : {scores['role_fit_score']}")
         print(f"     Experience Fit  : {scores['experience_fit_score']}")
-        print(f"     Experience      : {scores['resume_years']} yrs  {penalty_note}")
+        print(f"     Experience      : {scores['resume_experience_text']}  {penalty_note}")
         print(f"     Matched Groups  : {', '.join(scores['matched_role_groups'])}")
         print("\n     JD Requirement Breakdown (JD-Centric):")
         print(f"       {'JD Requirement':<20} {'Resume Section':<20} {'Vector':>8} {'BM25':>8} {'Hybrid':>8}")
@@ -1395,36 +1118,6 @@ def get_top_candidates(jd_filename, resume_collection,
 
     return ranked[:top_n]
 
-def build_compact_resume(resume_parsed):
-    experience = resume_parsed.get("experience") or []
-    compact_exp = []
-    for exp in experience:
-        compact_exp.append({
-            "company"         : exp.get("company"),
-            "title"           : exp.get("title"),
-            "start_date"      : exp.get("start_date"),
-            "end_date"        : exp.get("end_date"),
-            "responsibilities": exp.get("responsibilities", [])[:3]
-        })
-
-    return {
-        "name"          : resume_parsed.get("name"),
-        "summary"       : resume_parsed.get("summary"),
-        "skills"        : resume_parsed.get("skills"),
-        "experience"    : compact_exp,
-        "education"     : resume_parsed.get("education"),
-        "certifications": resume_parsed.get("certifications")
-    }
-
-
-def build_compact_jd(jd_parsed):
-    return {
-        "job_title"          : jd_parsed.get("job_title"),
-        "experience_required": jd_parsed.get("experience_required"),
-        "skills_required"    : jd_parsed.get("skills_required"),
-        "job_summary"        : jd_parsed.get("job_summary")
-    }
-
 
 def clean_json_str(json_str):
     # Remove trailing commas before } or ]
@@ -1440,7 +1133,7 @@ def normalize_summary_experience(summary, resume_years):
     if not isinstance(summary, dict):
         return summary
 
-    years_text = f"{resume_years} years of experience"
+    years_text = f"{format_experience_duration(resume_years)} of experience"
     experience_pattern = re.compile(
         r"\b\d+(?:\.\d+)?\s*\+?\s*years?(?:'|’)?(?:\s+of)?\s+experience\b",
         flags=re.IGNORECASE,
@@ -1487,13 +1180,13 @@ MATCH SCORES:
 - Relevance Score : {relevance_score}
 - Role Fit Score  : {role_fit_score}
 - Experience Fit  : {experience_fit_score}
-- Experience      : {resume_years} years (required: {required_years} years)
+- Experience      : {resume_experience_text} (required: {required_experience_text})
 
 Based on the above, generate a structured evaluation in the following JSON format:
 {
     "candidate_name"     : string,
     "match_summary"      : string (2-3 sentences overview of why this candidate fits or doesnt fit),
-    "key_strengths"      : [string] (top 1-2 reasons this candidate is suitable),
+    "key_strengths"      : [string] (top 1-2 candidate-specific strengths. Each strength must describe a capability, quality, or fit reason inferred from resume evidence and explain why it matters for this JD. Do not copy resume bullets, project descriptions, or responsibilities verbatim.),
     "skill_gaps"         : [string] (Only missing atomic JD capabilities.
   Do not include broad grouped requirements.
   Do not include capabilities with direct, equivalent, adjacent, or transferable resume evidence.
@@ -1510,6 +1203,14 @@ Rules:
 5. Dont include Company name anywhere in the response.
 6. Evaluate JD requirements lexically and semantically.Consider demonstrated outcomes, projects, responsibilities, and equivalent workflows as evidence even when the JD uses different terminology.
 7. Before listing a gap, search all resume fields—summary, skills, experience, projects, responsibilities, technologies, and certifications—for direct or semantically equivalent evidence
+8. For key_strengths, do not copy resume bullets or project descriptions as-is.
+9. A strength must be an evaluation of the candidate, not a raw resume fact.
+10. Each strength must be specific to this candidate's resume, not a generic quality that could apply to many candidates.
+11. Each strength must be supported by at least one concrete evidence item from this candidate's resume, such as a skill, project type, responsibility, domain, tool, certification, or measurable achievement.
+12. Do not reuse the same key_strengths wording across candidates.
+13. Do not write broad strengths like "strong technical foundation", "good problem-solving ability", or "relevant experience" unless they are tied to unique resume evidence.
+14. If two candidates have similar skills, differentiate the strength by the candidate's specific context, project type, tools, impact, domain, or seniority.
+15. When mentioning total experience, use exactly "{resume_experience_text}". Do not express experience as decimal years.
 
 Example:
 JD requirement: "Experience with Tool A, Tool B, workflow automation, and stakeholder communication."
@@ -1536,8 +1237,8 @@ Do not copy the full JD requirement as a gap. Split it into atomic capabilities,
         .replace("{relevance_score}", scores["relevance_score"]) \
         .replace("{role_fit_score}", scores.get("role_fit_score", "N/A")) \
         .replace("{experience_fit_score}", scores.get("experience_fit_score", "N/A")) \
-        .replace("{resume_years}",    str(scores["resume_years"])) \
-        .replace("{required_years}",  str(scores.get("required_years", "N/A")))
+        .replace("{resume_experience_text}", scores.get("resume_experience_text", "N/A")) \
+        .replace("{required_experience_text}", scores.get("required_experience_text", "N/A"))
 
     response = llm.invoke(formatted_prompt).content
 
