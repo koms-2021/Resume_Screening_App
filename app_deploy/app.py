@@ -299,7 +299,7 @@ def fetch_all_rows(supabase, table_name, page_size=1000):
 @st.cache_resource
 def load_summary_llm():
     return ChatGroq(
-        model="llama-3.1-8b-instant",
+        model="openai/gpt-oss-20b",
         temperature=0,
     )
 
