@@ -563,7 +563,7 @@ if st.session_state.show_upload and not st.session_state.summaries:
                     st.warning("Please choose a PDF resume first.")
                 else:
                     with st.spinner("Processing uploaded resume..."):
-                        resume_parser_llm = load_resume_parser_llm()
+                        resume_parser_llm = load_summary_llm()
                         st.session_state.upload_result = process_session_upload(
                             uploaded_resume=uploaded_resume,
                             llm=resume_parser_llm,
